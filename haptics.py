@@ -14,10 +14,12 @@ car rather than as effects.
               barely changes, so speed is a background sense, not a buzz.
   2 SURFACE   the road's character. Tarmac: smooth and quiet. Gravel: coarse
               grain plus scattered stone ticks. Holds steady per surface.
-  3 SLIDE     the car going sideways: a heavy, low, wallowing drag with
-              irregular "grabs" (tyres catching and letting go). While sliding,
-              the road layers DUCK (fade back) - losing grip feels like losing
-              touch with the road.
+  3 SLIDE     the car going sideways: a sharp, gravelly scrape. The drift
+              ANGLE sets its pitch and how dense the grit is (small angle =
+              sparse, low scratch; big angle = dense, high, rasping); the
+              sideways MOMENTUM sets how strong it is. Felt more in the hand
+              on the outside of the slide; road layers fade back under it.
+  AIRBORNE    every layer cuts out the moment the wheels leave the ground.
   4 SPIN      wheelspin: a light, fast, fluttering buzz - high and thin, so it
               never gets confused with a slide.
   5 LOCK      locked wheels: road texture freezes out and a coarse skid with
@@ -115,6 +117,8 @@ DEFAULTS = dict(
     surface=0.0, surface_amp=0.0,           # 2 surface (0 tarmac .. 1 gravel)
     tick_rate=0.0, tick_amp=0.0,
     slide=0.0, slide_amp=0.0, slide_bias=0.0,   # 3 slide (bias -1 left .. +1 right)
+    slide_angle=0.0, slide_mom=0.0, slide_grit=0.0,
+    air=0.0,                                # 1 = airborne: everything cut
     spin=0.0, spin_amp=0.0, spin_rate=1.0,  # 4 spin
     lock=0.0, lock_amp=0.0,                 # 5 lock
     engine_amp=0.0, engine_rate=1.0, limiter=False,  # 7 drivetrain
@@ -137,7 +141,9 @@ class Haptics:
         self.tarmac = _pair(30, 90, 3)               # smooth
         self.gravel = _pair(45, 180, 5)              # coarse grain
         self.ticks = [_Ticks(11), _Ticks(12)]
-        self.slide_src = _pair(14, 38, 7)            # heavy, low wallow
+        self.scrape = _pair(120, 350, 7)             # sideways scrape (rate = pitch)
+        self.slide_ticks = [_Ticks(31, length=0.006, decay=0.0018, lo=200, hi=450),
+                            _Ticks(32, length=0.006, decay=0.0018, lo=200, hi=450)]
         self.grab = _pair(3, 11, 9, seconds=8)       # irregular stick-slip rhythm
         self.spin_src = _pair(150, 260, 13)          # thin, high buzz
         self.flutter = _pair(18, 35, 15)             # fast flutter on the buzz
@@ -211,8 +217,14 @@ class Haptics:
                     + self.gravel[s].block(rate, frames) * surf) * g("surface_amp")
             road = road + self.ticks[s].block(p["tick_rate"], frames) * g("tick_amp")
 
-            grab = np.maximum(0.0, self.grab[s].block(1.0, frames)) * 1.6 + 0.35
-            slide = self.slide_src[s].block(1.0, frames) * grab * g("slide_amp") * outside
+            # slide: sharp sideways grit. Pitch and grit density rise with the
+            # drift angle; strength follows the sideways momentum.
+            ang = p["slide_angle"]
+            grab = 0.6 + 0.4 * np.maximum(0.0, self.grab[s].block(1.0, frames)) * 2
+            scrape = self.scrape[s].block(0.8 + 0.9 * ang, frames) * grab * g("slide_amp")
+            grit_rate = (40 + 520 * ang * p["slide_mom"]) * (0.35 + 0.65 * surf)
+            grit = self.slide_ticks[s].block(grit_rate, frames) * g("slide_grit")
+            slide = (scrape + grit) * outside
 
             flut = 0.6 + 0.4 * self.flutter[s].block(1.0, frames)
             spin = self.spin_src[s].block(max(0.5, p["spin_rate"]), frames) * flut * g("spin_amp")
@@ -228,10 +240,11 @@ class Haptics:
             eng = eng * (0.25 + 1.5 * (self.fuelcut.block(1.0, frames) > 0.1))
         clk = self.clunk_src.block(1.0, frames) * clunk * np.exp(-t / 0.04)
 
+        ground = 1.0 - g("air")                       # airborne -> silence
         out[:, 0] = 0
         out[:, 1] = 0
-        out[:, 2] = np.tanh((hands[0] + eng + clk) * self.gain)
-        out[:, 3] = np.tanh((hands[1] + eng + clk) * self.gain)
+        out[:, 2] = np.tanh((hands[0] + eng + clk) * self.gain) * ground
+        out[:, 3] = np.tanh((hands[1] + eng + clk) * self.gain) * ground
 
         with self.lock:
             self.impact *= float(np.exp(-frames / SR / 0.07))

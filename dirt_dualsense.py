@@ -239,7 +239,7 @@ class Effects:
         self.susp_unit = None          # 1.0 if metres, 0.001 if millimetres
         self.hit_cooldown = [0.0, 0.0]
         self.prev_fwd = None
-        self.hs = dict(tex=0.0, slide=0.0, bias=0.0, spin=0.0, lock=0.0,
+        self.hs = dict(tex=0.0, angle=0.0, mom=0.0, vy=0.0, air_until=0.0, slide=0.0, bias=0.0, spin=0.0, lock=0.0,
                        svlp0=0.0, svlp1=0.0, svlp2=0.0, svlp3=0.0)
 
     def compute(self, t, now):
@@ -342,7 +342,10 @@ class Effects:
     #   slip angle       p50 7 deg, p75 13 deg, p95 32 deg (rally = always a bit sideways)
     #   wheel/car speed  p50 +9 % (normal), real wheelspin 20-50 %
     TEX_TARMAC, TEX_GRAVEL = 0.08, 0.18
-    SLIDE_START, SLIDE_FULL = 10.0, 35.0       # degrees
+    SLIDE_START, SLIDE_FULL = 3.0, 40.0        # degrees: angle is felt across this whole range
+    MOM_START, MOM_FULL = 0.5, 10.0            # m/s of sideways velocity
+    AIR_DROOP = -140.0                         # mm: suspension hanging near full droop (-195)
+    AIR_DROOP_SOFT = -110.0                    # mm: ...or extended while in free-fall
     SPIN_START, SPIN_FULL = 0.20, 0.50         # slip ratio
     LOCK_START, LOCK_FULL = 0.25, 0.60
     IMPACT_HP = 1.5                            # m/s of sudden suspension movement
@@ -375,16 +378,30 @@ class Effects:
         slip_deg = math.degrees(math.atan2(abs(v_side), max(1.0, v_fwd))) if speed > 6 else 0.0
 
         # --- 3 SLIDE
-        slide = ema("slide", ramp01(slip_deg, self.SLIDE_START, self.SLIDE_FULL) ** 0.8, 0.10)
+        angle = ema("angle", ramp01(slip_deg, self.SLIDE_START, self.SLIDE_FULL) ** 0.7, 0.06)
+        mom = ema("mom", ramp01(abs(v_side), self.MOM_START, self.MOM_FULL), 0.06)
+        slide = angle * (0.35 + 0.65 * mom)        # how much "sideways" overall
         bias = ema("bias", (1.0 if v_side > 0 else -1.0) * min(1.0, slide * 3), 0.25)
+
+        # --- AIRBORNE: all wheels hanging at droop, or extended + free-falling
+        vy = t.velocity[1]
+        ay = (vy - st["vy"]) / dt
+        st["vy"] = vy
+        sp = t.susp_pos
+        droop = all(p < self.AIR_DROOP for p in sp)
+        falling = all(p < self.AIR_DROOP_SOFT for p in sp) and -14.0 < ay < -6.5
+        airborne = (droop or falling) and speed > 3
+        if airborne:
+            st["air_until"] = now + 0.06               # hold through flicker mid-jump
+        air = 1.0 if now < st["air_until"] else 0.0
 
         # --- 4 SPIN / 5 LOCK from wheel speed vs forward speed
         ws = sum(abs(w) for w in t.wheel_speed) / 4
         ratio = (ws - v_fwd) / max(5.0, v_fwd)
         spin_amt = ramp01(ratio, self.SPIN_START, self.SPIN_FULL) if t.throttle > 0.3 else 0.0
-        spin_amt = ema("spin", spin_amt, 0.06)
+        spin_amt = ema("spin", spin_amt, 0.06) * (1 - air)
         lock_amt = ramp01(-ratio, self.LOCK_START, self.LOCK_FULL) if t.brake > 0.2 else 0.0
-        lock_amt = ema("lock", lock_amt, 0.04)
+        lock_amt = ema("lock", lock_amt, 0.04) * (1 - air)
 
         # --- 6 IMPACT: big sudden suspension movement, per side
         for s, (i, j) in enumerate(((0, 2), (1, 3))):
@@ -412,7 +429,9 @@ class Effects:
                   surface_amp=(0.03 + 0.05 * surface) * moving * g,
                   tick_rate=surface * (10 + speed * 2.0),
                   tick_amp=0.16 * surface * moving * g,
-                  slide=slide, slide_amp=slide * 0.70 * g, slide_bias=bias,
+                  slide=slide, slide_amp=slide * 0.45 * g, slide_bias=bias,
+                  slide_angle=angle, slide_mom=mom, slide_grit=(0.15 + 0.35 * mom) * angle * g,
+                  air=air,
                   spin=spin_amt, spin_amp=spin_amt * 0.30 * g,
                   spin_rate=0.8 + max(0.0, ratio) * 3.0,
                   lock=lock_amt, lock_amp=lock_amt * 0.35 * g,
