@@ -15,8 +15,9 @@ actuators, the same way PS5 games do it) and **adaptive triggers**. No paid tool
 | Slide | drift angle from ~3° up to 40° | sharp, gravelly scrape. The **angle** sets its pitch and grit density (small = sparse, low scratch; big = dense, high rasp); **sideways momentum** sets its strength. Stronger in the hand on the outside of the slide, and the road texture fades back under it |
 | Wheelspin | wheels 20 %+ faster than the car | thin, fast, fluttering buzz |
 | Lock-up | wheels stopped under braking | road drops out, a skipping skid takes over |
-| Impacts | big hits / landings only | dull thud on the side that took it |
-| Drivetrain | near the redline | swells as a shift cue, ragged on the limiter, clunk on shifts |
+| Impacts | medium hits | dull thud on the side that took it |
+| Big hits | landings after real airtime, heavy bumps, crashes | sharp crack then a deep ~150 ms boom, scaled by size (DiRT sends no damage value, so crashes are detected from >3 g deceleration) |
+| Gear shift | each gear change | short clunk (engine RPM is deliberately not felt) |
 | Airborne | wheels off the ground, even small hops | **everything cuts out** until you land (detected from all four suspensions hanging at droop, or extended while in free-fall) |
 
 All layers are textured noise with slow random wander (no beeps or sine tones), so it
@@ -24,7 +25,7 @@ reads as the car rather than as effects. Thresholds were calibrated on a recorde
 
 **Adaptive triggers:**
 - **R2 (throttle):** free, with a small push on each gear change.
-- **L2 (brake):** free, then the lightest resistance in the bottom quarter; faint judder when the wheels lock.
+- **L2 (brake):** free, then 2/8 resistance in the bottom quarter; judders between 2/8 and 4/8 when the wheels lock.
 
 **Lightbar / player LEDs:** shift light and rev bar.
 

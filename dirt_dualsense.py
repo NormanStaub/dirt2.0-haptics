@@ -214,9 +214,10 @@ class Telemetry:
 # --------------------------------------------------------------------------
 
 # Brake resistance per zone of travel (0 = free, 8 = max). The hardware has
-# whole steps only, so "0 -> 1/8" is: free for most of the travel, then the
-# lightest step (1/8) in the bottom quarter (last ~25-30%).
-BRAKE_CURVE = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1]
+# whole steps only: free for most of the travel, then 2/8 in the bottom
+# quarter (last ~25-30%).
+BRAKE_CURVE = [0, 0, 0, 0, 0, 0, 0, 2, 2, 2]
+BRAKE_JUDDER = 2                    # steps added on alternate beats when wheels lock
 BRAKE_START = 7
 
 
@@ -239,7 +240,8 @@ class Effects:
         self.susp_unit = None          # 1.0 if metres, 0.001 if millimetres
         self.hit_cooldown = [0.0, 0.0]
         self.prev_fwd = None
-        self.hs = dict(tex=0.0, angle=0.0, mom=0.0, vy=0.0, air_until=0.0, slide=0.0, bias=0.0, spin=0.0, lock=0.0,
+        self.hs = dict(tex=0.0, angle=0.0, mom=0.0, vy=0.0, air_until=0.0, air_start=0.0,
+                       was_air=0.0, decel=0.0, prev_speed=0.0, big_cooldown=0.0, slide=0.0, bias=0.0, spin=0.0, lock=0.0,
                        svlp0=0.0, svlp1=0.0, svlp2=0.0, svlp3=0.0)
 
     def compute(self, t, now):
@@ -285,8 +287,8 @@ class Effects:
         if t.brake > 0.05 and lock > a.lock_threshold:
             # Faint judder: same resistance ramp, nudged +1 on alternate
             # ~40 ms steps (a vibration effect would drop the resistance).
-            bump = 1 if int(now * 25) % 2 else 0
-            l2 = trig_feedback(BRAKE_CURVE[:BRAKE_START] + [1 + bump] * (10 - BRAKE_START))
+            bump = BRAKE_JUDDER if int(now * 25) % 2 else 0
+            l2 = trig_feedback(BRAKE_CURVE[:BRAKE_START] + [BRAKE_CURVE[-1] + bump] * (10 - BRAKE_START))
         else:
             l2 = trig_feedback(BRAKE_CURVE)
 
@@ -349,6 +351,10 @@ class Effects:
     SPIN_START, SPIN_FULL = 0.20, 0.50         # slip ratio
     LOCK_START, LOCK_FULL = 0.25, 0.60
     IMPACT_HP = 1.5                            # m/s of sudden suspension movement
+    BIG_BUMP = 2.2                             # m/s suspension speed: heavy bump (p99.9 of a stage)
+    BIG_BUMP_FULL = 5.0
+    LANDING_AIRTIME = 0.10                     # s in the air before a landing gets a big hit
+    CRASH_DECEL = 30.0                         # m/s2 (~3 g, beyond any braking)
 
     def _haptics(self, t, now, dt, sv, speed, rpm_frac, real_rpm,
                  spin, lock, g_jolt):
@@ -391,9 +397,24 @@ class Effects:
         droop = all(p < self.AIR_DROOP for p in sp)
         falling = all(p < self.AIR_DROOP_SOFT for p in sp) and -14.0 < ay < -6.5
         airborne = (droop or falling) and speed > 3
+        touched = any(p > -100.0 for p in sp)          # a wheel is back on the ground
         if airborne:
             st["air_until"] = now + 0.06               # hold through flicker mid-jump
+        if touched:
+            st["air_until"] = 0.0                      # ...but release on touchdown
         air = 1.0 if now < st["air_until"] else 0.0
+
+        # --- BIG HIT: landing after real airtime
+        if air and not st["was_air"]:
+            st["air_start"] = now
+        if st["was_air"] and not air:
+            airtime = now - st["air_start"]
+            if airtime >= self.LANDING_AIRTIME:
+                comp = max(sv)
+                strength = 0.55 + 0.25 * ramp01(airtime, 0.1, 0.6) + 0.2 * ramp01(comp, 1.0, 3.0)
+                hx.pulse(strength)
+                st["big_cooldown"] = now + 0.3
+        st["was_air"] = air
 
         # --- 4 SPIN / 5 LOCK from wheel speed vs forward speed
         ws = sum(abs(w) for w in t.wheel_speed) / 4
@@ -413,11 +434,26 @@ class Effects:
         if g_jolt > 2.5:
             hx.hit(left=min(1.0, g_jolt / 5), right=min(1.0, g_jolt / 5))
 
+        # --- BIG HIT: heavy bumps (per side) and crashes
+        decel = ema("decel", (st["prev_speed"] - speed) / dt, 0.03)
+        if now > st["big_cooldown"] and not air:
+            left = max(abs(sv[0]), abs(sv[2]))
+            right = max(abs(sv[1]), abs(sv[3]))
+            peak = max(left, right)
+            if peak > self.BIG_BUMP:
+                strength = 0.45 + 0.55 * ramp01(peak, self.BIG_BUMP, self.BIG_BUMP_FULL)
+                hx.pulse(strength, left=0.6 + 0.4 * (left >= right), right=0.6 + 0.4 * (right > left))
+                st["big_cooldown"] = now + 0.3
+            if decel > self.CRASH_DECEL and st["prev_speed"] > 3:
+                hx.pulse(0.6 + 0.4 * ramp01(decel, self.CRASH_DECEL, 80.0))
+                st["big_cooldown"] = now + 0.4
+        st["prev_speed"] = speed
+
         # --- 7 DRIVETRAIN: silent until near the redline
         firing = real_rpm / 60.0 * 2.0
         while firing > 220:
             firing /= 2
-        eng_amp = ramp01(rpm_frac, 0.82, 1.0) * 0.10 * (0.4 + 0.6 * t.throttle)
+        eng_amp = 0.0                                  # RPM / redline not felt in the body
 
         # --- 1 SPEED
         moving = min(1.0, speed / 8.0)
@@ -436,7 +472,7 @@ class Effects:
                   spin_rate=0.8 + max(0.0, ratio) * 3.0,
                   lock=lock_amt, lock_amp=lock_amt * 0.35 * g,
                   engine_amp=eng_amp * g, engine_rate=firing / 110.0,
-                  limiter=rpm_frac > 0.97 and t.throttle > 0.5)
+                  limiter=False)
 
 # --------------------------------------------------------------------------
 

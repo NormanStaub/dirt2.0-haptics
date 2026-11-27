@@ -24,7 +24,9 @@ car rather than as effects.
               never gets confused with a slide.
   5 LOCK      locked wheels: road texture freezes out and a coarse skid with
               skips takes over.
-  6 IMPACT    big hits / landings only: a dull thud on the side that took it.
+  6 IMPACT    medium hits: a dull thud on the side that took it.
+  6b BIG HIT  landings after real airtime, heavy bumps and crashes: a sharp
+              crack followed by a deep ~150 ms boom, scaled by how big it was.
   7 DRIVETRAIN  nothing at normal revs; swells near the redline, ragged on
               the limiter, short clunk on shifts.
 """
@@ -151,6 +153,10 @@ class Haptics:
         self.skip = _Looper(_band_noise(6, 16, 4, 19), 19)
         self.wander = _pair(0.3, 3, 21, seconds=8)   # organic drift on everything
         self.thud = _pair(25, 70, 23)
+        self.boom = _pair(16, 50, 33)                # big pulse body
+        self.crack = _pair(60, 160, 35)              # big pulse attack
+        self.pulse_env = np.zeros(2, np.float32)
+        self.pulse_age = 1.0
         self.engine = _Looper(_band_noise(90, 130, 4, 25), 25)
         self.fuelcut = _Looper(_band_noise(8, 18, 4, 27), 27)
         self.clunk_src = _Looper(_band_noise(30, 110, 4, 29), 29)
@@ -168,6 +174,14 @@ class Haptics:
         with self.lock:
             self.impact[0] = max(self.impact[0], min(1.0, left))
             self.impact[1] = max(self.impact[1], min(1.0, right))
+
+    def pulse(self, strength=1.0, left=1.0, right=1.0):
+        """Big hit: landings, heavy bumps, crashes. left/right weight the hands."""
+        with self.lock:
+            s = min(1.0, max(0.0, strength))
+            self.pulse_env[0] = max(self.pulse_env[0], s * left)
+            self.pulse_env[1] = max(self.pulse_env[1], s * right)
+            self.pulse_age = 0.0
 
     def shift(self, strength=0.7):
         with self.lock:
@@ -193,6 +207,8 @@ class Haptics:
             p = dict(self.p)
             imp = self.impact.copy()
             clunk = self.clunk
+            pul = self.pulse_env.copy()
+            age = self.pulse_age
         q = self.prev
         ramp = np.linspace(0, 1, frames, endpoint=False, dtype=np.float32)
 
@@ -232,8 +248,12 @@ class Haptics:
             lock = self.skid[s].block(1.0, frames) * skip * g("lock_amp")
 
             thud = self.thud[s].block(1.0, frames) * imp[s] * np.exp(-t / 0.07)
+            # big pulse: sharp crack for the first ~15 ms, then a deep 150 ms boom
+            ta = age + t
+            big = (self.boom[s].block(1.0, frames) * 1.3 * np.exp(-ta / 0.15)
+                   + self.crack[s].block(1.0, frames) * 0.9 * np.exp(-ta / 0.015)) * pul[s]
 
-            hands.append((speed + road) * duck * w + slide * w + spin + lock + thud)
+            hands.append((speed + road) * duck * w + slide * w + spin + lock + thud + big)
 
         eng = self.engine.block(max(0.2, p["engine_rate"]), frames) * g("engine_amp")
         if p["limiter"]:
@@ -249,4 +269,8 @@ class Haptics:
         with self.lock:
             self.impact *= float(np.exp(-frames / SR / 0.07))
             self.clunk *= float(np.exp(-frames / SR / 0.04))
+            if self.pulse_age < 0.6:
+                self.pulse_age += frames / SR
+            else:
+                self.pulse_env[:] = 0.0
         self.prev = p
