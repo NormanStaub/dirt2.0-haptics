@@ -37,7 +37,7 @@ import numpy as np
 import sounddevice as sd
 
 SR = 48000
-BLOCK = 256          # ~5 ms
+BLOCK = 128          # ~2.7 ms
 
 
 def find_device():
@@ -161,9 +161,18 @@ class Haptics:
         self.fuelcut = _Looper(_band_noise(8, 18, 4, 27), 27)
         self.clunk_src = _Looper(_band_noise(30, 110, 4, 29), 29)
 
-        self.stream = sd.OutputStream(device=self.device, samplerate=SR, channels=4,
-                                      blocksize=BLOCK, dtype="float32",
-                                      latency="low", callback=self._cb)
+        # WASAPI exclusive mode cuts output latency from ~22 ms (shared) to ~6 ms.
+        self.mode = "exclusive"
+        try:
+            self.stream = sd.OutputStream(device=self.device, samplerate=SR, channels=4,
+                                          blocksize=BLOCK, dtype="float32", latency="low",
+                                          callback=self._cb,
+                                          extra_settings=sd.WasapiSettings(exclusive=True))
+        except Exception:
+            self.mode = "shared"
+            self.stream = sd.OutputStream(device=self.device, samplerate=SR, channels=4,
+                                          blocksize=BLOCK, dtype="float32",
+                                          latency="low", callback=self._cb)
 
     # ---- called from telemetry thread ----
     def update(self, **kw):

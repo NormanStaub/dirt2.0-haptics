@@ -84,7 +84,12 @@ git-ignored.
   velocity and body axes, suspension position/velocity, wheel speeds, inputs, gear, RPM.
 - **Haptics:** over USB the DualSense is a 4-channel audio device. Channels 3–4 go
   straight to the left/right actuators. `haptics.py` synthesizes that signal in real time
-  (`sounddevice`, WASAPI, ~5 ms blocks).
+  (`sounddevice`, WASAPI **exclusive** mode, 2.7 ms blocks, ~6 ms output latency; falls back
+  to shared mode, ~22 ms, if exclusive isn't available).
+- **Latency:** queued packets are drained every read so the newest state always wins;
+  controller writes (~5 ms each over USB) run on a background thread and only when
+  something changed. The game sends one packet per frame (~15 ms at 66 fps), which is
+  the floor.
 - **Triggers / lights:** HID output report `0x02` (USB) or `0x31` with CRC32 (Bluetooth),
   via `hidapi`. Trigger effects use the feedback (`0x21`) zone format.
 

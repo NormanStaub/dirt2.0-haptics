@@ -29,6 +29,7 @@ import argparse
 import math
 import socket
 import struct
+import threading
 import sys
 import time
 import zlib
@@ -102,11 +103,22 @@ def flat(start_zone, s):
 # --------------------------------------------------------------------------
 
 class DualSense:
+    """Controller output. Reports are written from a background thread (a USB
+    write blocks ~5 ms), only when something changed, and always the newest
+    state - so telemetry handling never waits on the controller."""
+
     def __init__(self):
         self.dev = None
         self.bt = False
         self.seq = 0
         self.last_try = 0.0
+        self.last_common = None
+        self.last_queued = 0.0
+        self._slot = None
+        self._cv = threading.Condition()
+        self._running = True
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer.start()
 
     def connect(self):
         now = time.time()
@@ -124,12 +136,50 @@ class DualSense:
             bus = info.get("bus_type")
             self.bt = (bus == 2) if bus is not None else info["interface_number"] == -1
             self.dev = d
+            self.last_common = None
             print(f"[controller] connected over {'Bluetooth' if self.bt else 'USB'}")
             return True
         return False
 
+    def _report(self, c):
+        if self.bt:
+            r = bytearray(78)
+            r[0] = 0x31
+            r[1] = (self.seq & 0x0F) << 4
+            self.seq = (self.seq + 1) & 0x0F
+            r[2] = 0x10
+            r[3:3 + 47] = c
+            crc = zlib.crc32(b"\xA2" + bytes(r[:74])) & 0xFFFFFFFF
+            r[74:78] = struct.pack("<I", crc)
+            return bytes(r)
+        return b"\x02" + bytes(c)
+
+    def _write(self, c):
+        dev = self.dev
+        if dev is None:
+            return
+        try:
+            dev.write(self._report(c))
+        except (OSError, ValueError):
+            print("[controller] lost connection, retrying...")
+            try:
+                dev.close()
+            except Exception:
+                pass
+            self.dev = None
+
+    def _write_loop(self):
+        while True:
+            with self._cv:
+                while self._slot is None and self._running:
+                    self._cv.wait()
+                if self._slot is None and not self._running:
+                    return
+                c, self._slot = self._slot, None
+            self._write(c)
+
     def send(self, rumble_low=0, rumble_high=0, r2=None, l2=None,
-             rgb=(0, 0, 64), player_leds=0, haptics=False):
+             rgb=(0, 0, 64), player_leds=0, haptics=False, force=False):
         if not self.connect():
             return
         c = bytearray(47)
@@ -146,33 +196,28 @@ class DualSense:
         c[43] = player_leds & 0x1F
         c[44], c[45], c[46] = (int(max(0, min(255, v))) for v in rgb)
 
-        if self.bt:
-            r = bytearray(78)
-            r[0] = 0x31
-            r[1] = (self.seq & 0x0F) << 4
-            self.seq = (self.seq + 1) & 0x0F
-            r[2] = 0x10
-            r[3:3 + 47] = c
-            crc = zlib.crc32(b"\xA2" + bytes(r[:74])) & 0xFFFFFFFF
-            r[74:78] = struct.pack("<I", crc)
-        else:
-            r = b"\x02" + bytes(c)
-        try:
-            self.dev.write(bytes(r))
-        except (OSError, ValueError):
-            print("[controller] lost connection, retrying...")
-            try:
-                self.dev.close()
-            except Exception:
-                pass
-            self.dev = None
+        now = time.time()
+        # unchanged state: skip, but refresh twice a second in case something
+        # else (e.g. Steam) touched the controller
+        if not force and c == self.last_common and now - self.last_queued < 0.5:
+            return
+        self.last_common = bytes(c)
+        self.last_queued = now
+        with self._cv:
+            self._slot = bytes(c)           # newest wins
+            self._cv.notify()
 
     def reset(self):
-        self.send()
+        self.send(force=True)
 
     def close(self):
         if self.dev:
             self.reset()
+        with self._cv:
+            self._running = False
+            self._cv.notify()
+        self._writer.join(timeout=1.0)
+        if self.dev:
             self.dev.close()
             self.dev = None
 
@@ -384,8 +429,8 @@ class Effects:
         slip_deg = math.degrees(math.atan2(abs(v_side), max(1.0, v_fwd))) if speed > 6 else 0.0
 
         # --- 3 SLIDE
-        angle = ema("angle", ramp01(slip_deg, self.SLIDE_START, self.SLIDE_FULL) ** 0.7, 0.06)
-        mom = ema("mom", ramp01(abs(v_side), self.MOM_START, self.MOM_FULL), 0.06)
+        angle = ema("angle", ramp01(slip_deg, self.SLIDE_START, self.SLIDE_FULL) ** 0.7, 0.03)
+        mom = ema("mom", ramp01(abs(v_side), self.MOM_START, self.MOM_FULL), 0.03)
         slide = angle * (0.35 + 0.65 * mom)        # how much "sideways" overall
         bias = ema("bias", (1.0 if v_side > 0 else -1.0) * min(1.0, slide * 3), 0.25)
 
@@ -420,9 +465,9 @@ class Effects:
         ws = sum(abs(w) for w in t.wheel_speed) / 4
         ratio = (ws - v_fwd) / max(5.0, v_fwd)
         spin_amt = ramp01(ratio, self.SPIN_START, self.SPIN_FULL) if t.throttle > 0.3 else 0.0
-        spin_amt = ema("spin", spin_amt, 0.06) * (1 - air)
+        spin_amt = ema("spin", spin_amt, 0.03) * (1 - air)
         lock_amt = ramp01(-ratio, self.LOCK_START, self.LOCK_FULL) if t.brake > 0.2 else 0.0
-        lock_amt = ema("lock", lock_amt, 0.04) * (1 - air)
+        lock_amt = ema("lock", lock_amt, 0.025) * (1 - air)
 
         # --- 6 IMPACT: big sudden suspension movement, per side
         for s, (i, j) in enumerate(((0, 2), (1, 3))):
@@ -502,12 +547,23 @@ def run_bridge(args):
     packets = 0
     try:
         while True:
-            now = time.time()
             try:
-                data, _ = sock.recvfrom(2048)
+                batch = [sock.recvfrom(2048)[0]]
             except socket.timeout:
-                data = None
-            if data:
+                batch = []
+            if batch:
+                # drain anything else already queued so we never act on stale data
+                sock.setblocking(False)
+                try:
+                    while len(batch) < 64:
+                        batch.append(sock.recvfrom(2048)[0])
+                except (BlockingIOError, OSError):
+                    pass
+                sock.settimeout(0.05)
+            now = time.time()
+            data = None
+            out = None
+            for data in batch:
                 if rec:
                     rec.write(struct.pack("<dI", now, len(data)) + data)
                     if packets % 120 == 0:
@@ -519,11 +575,13 @@ def run_bridge(args):
                     last_packet = now
                     idle_sent = False
                     packets += 1
-                    pad.send(**fx.compute(t, now))
+                    out = fx.compute(t, now)        # every packet feeds the logic...
                     if args.verbose and packets % 30 == 0:
                         print(f"  speed {t.speed*3.6:5.0f} km/h  rpm {t.rpm:6.0f}  gear {t.gear:2d}  "
                               f"thr {t.throttle:.2f} brk {t.brake:.2f}")
-            elif last_packet and now - last_packet > args.timeout and not idle_sent:
+            if out:
+                pad.send(**out)                     # ...only the newest goes to the pad
+            if not batch and last_packet and now - last_packet > args.timeout and not idle_sent:
                 print("[telemetry] no data (paused / menu) - triggers released")
                 pad.reset()
                 if hx:
@@ -552,7 +610,8 @@ def make_haptics(args, pad):
         from haptics import Haptics
         hx = Haptics(gain=args.haptics_gain)
         hx.start()
-        print(f"[haptics] HD haptics on (audio device #{hx.device})")
+        print(f"[haptics] HD haptics on (audio device #{hx.device}, {hx.mode} mode, "
+              f"{hx.stream.latency * 1000:.1f} ms output latency)")
         return hx
     except Exception as e:  # missing libs, device busy, no USB audio
         print(f"[haptics] unavailable ({e}) - using rumble-motor mode")
